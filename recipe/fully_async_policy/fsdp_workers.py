@@ -62,10 +62,22 @@ def get_inference_model(rollout):
         )
     return inference_model
 
+from recipe.one_step_off_policy.distributed_util import vllm_stateless_init_process_group
 
 class DetachNcclSync(AsyncActorRolloutRefWorker):
     def _get_actor_params(self):
         pass
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
+        rank = torch.distributed.get_rank() + rank_offset
+        self._weight_sync_group = vllm_stateless_init_process_group(
+            master_address,
+            master_port,
+            rank,
+            world_size,
+            get_torch_device().current_device(),
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self):
@@ -90,9 +102,8 @@ class DetachNcclSync(AsyncActorRolloutRefWorker):
                     origin_data = origin_data.full_tensor()
                 if torch.distributed.get_rank() == 0:
                     tensor.copy_(origin_data)
-            from ray.util.collective import collective
-
-            collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
+            
+            self._weight_sync_group.broadcast(tensor, src=0, stream=get_torch_device().current_stream())
             if self._is_rollout:
                 inference_model.load_weights([(key, tensor)])
 
