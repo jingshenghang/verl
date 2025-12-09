@@ -64,16 +64,29 @@ class ParameterSynchronizer:
         self.weights_info = self.actor_wg.get_actor_weights_info()[0]
         self.rollout_wg.set_actor_weights_info(self.weights_info)
 
+    def create_weight_sync_group(self):
+        master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote())
+        master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
+        world_size = len(self.actor_wg.workers + self.rollout_wg.workers)
+        self.actor_wg.create_weight_sync_group(
+            master_address,
+            master_port,
+            0,
+            world_size,
+        )
+        ray.get(
+            self.rollout_wg.create_weight_sync_group(
+                master_address,
+                master_port,
+                len(self.actor_wg.workers),
+                world_size,
+            )
+        )
+
     def _init_sync_group(self):
         print("[ParameterSynchronizer] Initializing parameter synchronization group...")
         actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
-        collective.create_collective_group(
-            actor_rollout_workers,
-            len(actor_rollout_workers),
-            list(range(0, len(actor_rollout_workers))),
-            backend=get_nccl_backend(),
-            group_name=self.sync_group_name,
-        )
+        self.create_weight_sync_group()
 
     def sync_weights(self, version, validate=False, global_steps=0):
         """Sync weights between trainer and rollouter, and update parameter version"""
