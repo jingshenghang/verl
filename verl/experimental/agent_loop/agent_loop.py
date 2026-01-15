@@ -466,17 +466,34 @@ class AgentLoopWorkerBase:
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
-        # tasks = []
-        # for i in range(len(batch)):
-        #     trace_this_sample = i in traced_indices
-        #     kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-        #     tasks.append(
-        #         asyncio.create_task(
-        #             self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
-        #         )
-        #     )
-        # outputs = await asyncio.gather(*tasks)
+        use_content_aware_balancing = True
+        if use_content_aware_balancing:
+            tasks = []
+            for i in range(len(batch)):
+                trace_this_sample = i in traced_indices
+                kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+                tasks.append(
+                    asyncio.create_task(
+                        self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                    )
+                )
+            outputs = await asyncio.gather(*tasks)
+        else:
+            outputs = await self._content_aware_balancing_rollout(
+                batch, index, traced_indices, sampling_params, trajectory_info
+            )
 
+        output = self._postprocess(outputs)
+        return output
+
+    async def _content_aware_balancing_rollout(
+        self,
+        batch: DataProto,
+        index: np.ndarray,
+        traced_indices: set[int],
+        sampling_params: dict[str, Any],
+        trajectory_info: list[dict],
+    ) -> list[_InternalAgentLoopOutput]:
         # step 0: set up variables
         first_batch_task = []
         fast_group_idx = set()
@@ -521,9 +538,7 @@ class AgentLoopWorkerBase:
         # step 6: wait for all task finish
         slow_fast_output = await asyncio.gather(*(slow_tasks + fast_tasks))
         outputs.extend(slow_fast_output)
-
-        output = self._postprocess(outputs)
-        return output
+        return outputs
 
     async def _launch_task_after_first(
         self,
