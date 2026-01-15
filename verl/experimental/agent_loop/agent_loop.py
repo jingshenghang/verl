@@ -466,20 +466,102 @@ class AgentLoopWorkerBase:
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
-        tasks = []
-        for i in range(len(batch)):
-            trace_this_sample = i in traced_indices
-            kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-            tasks.append(
-                asyncio.create_task(
-                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+        use_content_aware_balancing = True
+        if use_content_aware_balancing:
+            tasks = []
+            for i in range(len(batch)):
+                trace_this_sample = i in traced_indices
+                kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+                tasks.append(
+                    asyncio.create_task(
+                        self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                    )
                 )
+            outputs = await asyncio.gather(*tasks)
+        else:
+            outputs = await self._content_aware_balancing_rollout(
+                batch, index, traced_indices, sampling_params, trajectory_info
             )
-        outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs)
-
         return output
+
+    async def _content_aware_balancing_rollout(
+        self,
+        batch: DataProto,
+        index: np.ndarray,
+        traced_indices: set[int],
+        sampling_params: dict[str, Any],
+        trajectory_info: list[dict],
+    ) -> list[_InternalAgentLoopOutput]:
+        # step 0: set up variables
+        first_batch_task = []
+        fast_group_idx = set()
+        slow_group_idx = set()
+        outputs = []
+        slow_tasks = []
+        fast_tasks = []
+        unique_sample_indices = set(np.unique(index))
+
+        # step 1: create first request task in group n
+        for i in range(len(batch)):
+            if trajectory_info[i]["rollout_n"] == 0:
+                trace_this_sample = i in traced_indices
+                kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+                first_batch_task.append(
+                    asyncio.create_task(
+                        self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                    )
+                )
+
+        # step 2: wait for 80% task finish, split fast and slow group
+        # breakpoint()
+        for completed_task in asyncio.as_completed(first_batch_task):
+            output = await completed_task
+            outputs.append(output)
+
+            fast_group_idx.add(output.extra_fields["index"])  # TODO completed_task is not the same as create task
+            if len(fast_group_idx) == int(0.8 * len(unique_sample_indices)):  # only sand task once
+                # step 3: split fast group id and slow group
+                slow_group_idx = unique_sample_indices - fast_group_idx  # TODO unique_sample_indices 是否正确
+
+                # step 4: launch slow group idx task
+                slow_tasks = await self._launch_task_after_first(
+                    batch, slow_group_idx, trajectory_info, traced_indices, sampling_params, **kwargs
+                )
+
+                # step 5: launch fast group idx task
+                fast_tasks = await self._launch_task_after_first(
+                    batch, fast_group_idx, trajectory_info, traced_indices, sampling_params, **kwargs
+                )
+
+        # step 6: wait for all task finish
+        slow_fast_output = await asyncio.gather(*(slow_tasks + fast_tasks))
+        outputs.extend(slow_fast_output)
+        return outputs
+
+    async def _launch_task_after_first(
+        self,
+        batch: DataProto,
+        idx_list: set[int],
+        trajectory_info: list[dict],
+        traced_indices: set[int],
+        sampling_params: dict[str, Any],
+        **kwargs,
+    ):
+        tasks = []
+        for i in range(len(batch)):
+            # TODO merge with first batch logic. split three mode: all rollout_n, first rollout_n, other rollout_n
+            # TODO what if batch.non_tensor_batch don't have ["index"]? Maybe for PPO only have 1 rollout_n
+            # TODO if there is only rollout_n == 0, do nothing
+            if trajectory_info[i]["rollout_n"] > 0 and batch.non_tensor_batch["index"][i] in idx_list:
+                trace_this_sample = i in traced_indices
+                kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+                task = asyncio.create_task(
+                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                )
+                tasks.append(task)
+        return tasks
 
     async def _run_agent_loop(
         self,
@@ -518,6 +600,7 @@ class AgentLoopWorkerBase:
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        output.extra_fields["index"] = kwargs["index"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
