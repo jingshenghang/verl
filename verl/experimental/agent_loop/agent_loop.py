@@ -946,14 +946,18 @@ class AgentLoopManager:
         if self.reward_model_manager:
             self.reward_model_manager.wake_up()
 
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
-        outputs = ray.get(
-            [
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
-            ]
-        )
-        output = DataProto.concat(outputs)
+        if use_long_tail_rebalancing == False:
+            chunkes = prompts.chunk(len(self.agent_loop_workers))
+            outputs = ray.get(
+                [
+                    worker.generate_sequences.remote(chunk)
+                    for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+                ]
+            )
+            output = DataProto.concat(outputs)
+        else:
+            output = self._rabalancing(prompts)
+
         # Fix for Issue #4147: Always call sleep() to ensure proper cleanup
         self.sleep()
         if self.reward_model_manager:
@@ -965,6 +969,60 @@ class AgentLoopManager:
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
+
+    def _rabalancing(self, prompts):
+        # step 1: Create 1st rollout remote tasks and get futures
+        chunk_spec = prompts.chunk(len(self.agent_loop_workers))  # TODO get the 1st rollout group
+        chunk_main = prompts - chunk_spec
+        futures_spec = [
+            worker.generate_sequences.remote(chunk)
+            for worker, chunk in zip(self.agent_loop_workers, chunk_spec, strict=True)
+        ]
+
+        num_workers = len(futures_spec)
+
+        # Directly wait for 80% of the tasks to complete
+        num_returns_80_percent = int(num_workers * 0.8)
+
+        # Wait until at least 80% of tasks are completed
+        # This will block until num_returns_80_percent futures are done
+        completed_futures_spec, remaining_futures_spec = ray.wait(
+            futures_spec,
+            num_returns=num_returns_80_percent,
+            timeout=None,  # Wait indefinitely
+        )
+
+        # Now get the results for the completed futures
+        completed_results_spec = ray.get(completed_futures_spec)
+
+        # Your custom action here when 80% results are returned
+
+        chunk_fast = []  # TODO get index according to completed_result_spec
+        chunk_slow = chunk_main - chunk_fast
+
+        print(f"80% of tasks completed ({num_returns_80_percent}/{num_workers} workers)")
+        futures_slow = [
+            worker.generate_sequences.remote(chunk)
+            for worker, chunk in zip(self.agent_loop_workers, chunk_slow, strict=True)
+        ]
+        futures_fast = [
+            worker.generate_sequences.remote(chunk)
+            for worker, chunk in zip(self.agent_loop_workers, chunk_fast, strict=True)
+        ]
+        # You can add your custom code here
+
+        # Wait for the remaining futures to complete
+        if remaining_futures_spec:
+            remaining_results_spec = ray.get(remaining_futures_spec)
+        else:
+            remaining_results_spec = []
+        completed_results_fast = ray.get(futures_fast)
+        completed_results_slow = ray.get(futures_slow)
+
+        # Combine all results (note: order is not preserved with this approach)
+        all_results = completed_results_spec + remaining_results_spec + completed_results_fast + completed_results_slow
+
+        return all_results
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}
